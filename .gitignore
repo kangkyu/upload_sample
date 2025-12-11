@@ -29,3 +29,10 @@ Thumbs.db
 *.mov
 *.mp4
 *.avi
+
+# Credentials and environment files
+*.json
+!go.mod
+!go.sum
+.env
+.env.local
