@@ -17,6 +17,7 @@ import (
     "path/filepath"
     "strconv"
     "strings"
+    "sync"
     "time"
 
     "cloud.google.com/go/storage"
@@ -38,6 +39,7 @@ type Asset struct {
     Status        string    `json:"status"` // pending, approved, rejected, uploaded
     GCSPath       string    `json:"gcs_path"`
     ThumbnailPath *string   `json:"thumbnail_path,omitempty"`
+    PreviewPath   *string   `json:"preview_path,omitempty"`
     YouTubeID     *string   `json:"youtube_id,omitempty"`
     CreatedAt     time.Time `json:"created_at"`
     UpdatedAt     time.Time `json:"updated_at"`
@@ -79,14 +81,14 @@ func (s *AssetStore) Create(ctx context.Context, asset *Asset) (*Asset, error) {
 func (s *AssetStore) Get(ctx context.Context, id int) (*Asset, error) {
     query := `
         SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
-               a.thumbnail_path, yv.youtube_id, a.created_at, a.updated_at
+               a.thumbnail_path, a.preview_path, yv.youtube_id, a.created_at, a.updated_at
         FROM assets a
         LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
         WHERE a.id = $1`
     asset := &Asset{}
     err := s.db.QueryRowContext(ctx, query, id).Scan(
         &asset.ID, &asset.Name, &asset.Size, &asset.MimeType,
-        &asset.Status, &asset.GCSPath, &asset.ThumbnailPath, &asset.YouTubeID,
+        &asset.Status, &asset.GCSPath, &asset.ThumbnailPath, &asset.PreviewPath, &asset.YouTubeID,
         &asset.CreatedAt, &asset.UpdatedAt,
     )
     if err == sql.ErrNoRows {
@@ -104,7 +106,7 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
     if status != "" {
         query = `
             SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
-                   a.thumbnail_path, yv.youtube_id, a.created_at, a.updated_at
+                   a.thumbnail_path, a.preview_path, yv.youtube_id, a.created_at, a.updated_at
             FROM assets a
             LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
             WHERE a.status = $1 ORDER BY a.created_at DESC`
@@ -112,7 +114,7 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
     } else {
         query = `
             SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
-                   a.thumbnail_path, yv.youtube_id, a.created_at, a.updated_at
+                   a.thumbnail_path, a.preview_path, yv.youtube_id, a.created_at, a.updated_at
             FROM assets a
             LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
             ORDER BY a.created_at DESC`
@@ -129,7 +131,7 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
         asset := &Asset{}
         err := rows.Scan(
             &asset.ID, &asset.Name, &asset.Size, &asset.MimeType,
-            &asset.Status, &asset.GCSPath, &asset.ThumbnailPath, &asset.YouTubeID,
+            &asset.Status, &asset.GCSPath, &asset.ThumbnailPath, &asset.PreviewPath, &asset.YouTubeID,
             &asset.CreatedAt, &asset.UpdatedAt,
         )
         if err != nil {
@@ -159,6 +161,13 @@ func (s *AssetStore) UpdateThumbnailPath(ctx context.Context, id int, thumbnailP
     _, err := s.db.ExecContext(ctx,
         `UPDATE assets SET thumbnail_path = $1, updated_at = NOW() WHERE id = $2`,
         thumbnailPath, id)
+    return err
+}
+
+func (s *AssetStore) UpdatePreviewPath(ctx context.Context, id int, previewPath string) error {
+    _, err := s.db.ExecContext(ctx,
+        `UPDATE assets SET preview_path = $1, updated_at = NOW() WHERE id = $2`,
+        previewPath, id)
     return err
 }
 
@@ -318,6 +327,12 @@ func (s *TokenStore) Get(ctx context.Context) (*oauth2.Token, error) {
     return token, nil
 }
 
+// AssetEvent represents an SSE event for asset updates
+type AssetEvent struct {
+    Type  string `json:"type"`  // "asset_updated"
+    Asset *Asset `json:"asset"`
+}
+
 // Server holds the HTTP server dependencies
 type Server struct {
     store             *AssetStore
@@ -326,6 +341,10 @@ type Server struct {
     gcsClient         *storage.Client
     bucketName        string
     youtubeOAuth      *oauth2.Config
+
+    // SSE clients
+    sseClients   map[chan AssetEvent]struct{}
+    sseMu        sync.RWMutex
 }
 
 func NewServer(db *sql.DB, bucketName string, ytClientID, ytClientSecret string, encryptionKey []byte) (*Server, error) {
@@ -353,11 +372,76 @@ func NewServer(db *sql.DB, bucketName string, ytClientID, ytClientSecret string,
         gcsClient:         client,
         bucketName:        bucketName,
         youtubeOAuth:      youtubeOAuth,
+        sseClients:        make(map[chan AssetEvent]struct{}),
     }, nil
 }
 
 func (s *Server) Close() error {
     return s.gcsClient.Close()
+}
+
+// SSE methods
+
+func (s *Server) sseSubscribe() chan AssetEvent {
+    ch := make(chan AssetEvent, 10)
+    s.sseMu.Lock()
+    s.sseClients[ch] = struct{}{}
+    s.sseMu.Unlock()
+    return ch
+}
+
+func (s *Server) sseUnsubscribe(ch chan AssetEvent) {
+    s.sseMu.Lock()
+    delete(s.sseClients, ch)
+    s.sseMu.Unlock()
+    close(ch)
+}
+
+func (s *Server) sseBroadcast(event AssetEvent) {
+    s.sseMu.RLock()
+    defer s.sseMu.RUnlock()
+    for ch := range s.sseClients {
+        select {
+        case ch <- event:
+        default:
+            // Client too slow, skip
+        }
+    }
+}
+
+func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+    // Set SSE headers
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+    w.Header().Set("Access-Control-Allow-Origin", "*")
+
+    // Subscribe to events
+    ch := s.sseSubscribe()
+    defer s.sseUnsubscribe(ch)
+
+    // Flush initial connection
+    if flusher, ok := w.(http.Flusher); ok {
+        flusher.Flush()
+    }
+
+    // Send events until client disconnects
+    for {
+        select {
+        case <-r.Context().Done():
+            return
+        case event := <-ch:
+            data, err := json.Marshal(event)
+            if err != nil {
+                log.Printf("SSE marshal error: %v", err)
+                continue
+            }
+            fmt.Fprintf(w, "data: %s\n\n", data)
+            if flusher, ok := w.(http.Flusher); ok {
+                flusher.Flush()
+            }
+        }
+    }
 }
 
 // CORS middleware for React/mobile clients
@@ -487,6 +571,99 @@ func (s *Server) generateThumbnail(ctx context.Context, asset *Asset) error {
     }
 
     log.Printf("Generated thumbnail for asset %d: %s", asset.ID, thumbnailPath)
+
+    // Broadcast SSE event
+    updatedAsset, err := s.store.Get(ctx, asset.ID)
+    if err == nil && updatedAsset != nil {
+        s.sseBroadcast(AssetEvent{Type: "asset_updated", Asset: updatedAsset})
+    }
+
+    return nil
+}
+
+// generatePreview creates a low-resolution MP4 preview from a video file using ffmpeg
+// Downloads from GCS, transcodes to low-res MP4, uploads back to GCS
+func (s *Server) generatePreview(ctx context.Context, asset *Asset) error {
+    if !isVideoFile(asset.Name) {
+        return nil // Skip non-video files
+    }
+
+    // Create temp files
+    tempVideo, err := os.CreateTemp("", "video-*"+filepath.Ext(asset.Name))
+    if err != nil {
+        return fmt.Errorf("failed to create temp video file: %w", err)
+    }
+    defer os.Remove(tempVideo.Name())
+    defer tempVideo.Close()
+
+    tempPreview, err := os.CreateTemp("", "preview-*.mp4")
+    if err != nil {
+        return fmt.Errorf("failed to create temp preview file: %w", err)
+    }
+    defer os.Remove(tempPreview.Name())
+    tempPreview.Close()
+
+    // Download video from GCS
+    obj := s.gcsClient.Bucket(s.bucketName).Object(asset.GCSPath)
+    reader, err := obj.NewReader(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to read from GCS: %w", err)
+    }
+    defer reader.Close()
+
+    if _, err := io.Copy(tempVideo, reader); err != nil {
+        return fmt.Errorf("failed to download video: %w", err)
+    }
+    tempVideo.Close()
+
+    // Generate low-res preview with ffmpeg
+    // Scale to 480p height, use H.264 codec, reduce bitrate for smaller file size
+    cmd := exec.CommandContext(ctx, "ffmpeg",
+        "-i", tempVideo.Name(),
+        "-vf", "scale=-2:480",           // Scale to 480p height, width auto (divisible by 2)
+        "-c:v", "libx264",               // H.264 video codec
+        "-preset", "fast",               // Encoding speed/quality tradeoff
+        "-crf", "28",                    // Quality (higher = smaller file, lower quality)
+        "-c:a", "aac",                   // AAC audio codec
+        "-b:a", "128k",                  // Audio bitrate
+        "-movflags", "+faststart",       // Enable streaming (metadata at start)
+        "-y",
+        tempPreview.Name(),
+    )
+    if output, err := cmd.CombinedOutput(); err != nil {
+        return fmt.Errorf("ffmpeg failed: %w, output: %s", err, string(output))
+    }
+
+    // Upload preview to GCS
+    previewPath := fmt.Sprintf("previews/%d.mp4", asset.ID)
+    previewReader, err := os.Open(tempPreview.Name())
+    if err != nil {
+        return fmt.Errorf("failed to open preview: %w", err)
+    }
+    defer previewReader.Close()
+
+    wc := s.gcsClient.Bucket(s.bucketName).Object(previewPath).NewWriter(ctx)
+    wc.ContentType = "video/mp4"
+    if _, err := io.Copy(wc, previewReader); err != nil {
+        return fmt.Errorf("failed to upload preview: %w", err)
+    }
+    if err := wc.Close(); err != nil {
+        return fmt.Errorf("failed to close GCS writer: %w", err)
+    }
+
+    // Update asset with preview path
+    if err := s.store.UpdatePreviewPath(ctx, asset.ID, previewPath); err != nil {
+        return fmt.Errorf("failed to update preview path: %w", err)
+    }
+
+    log.Printf("Generated preview for asset %d: %s", asset.ID, previewPath)
+
+    // Broadcast SSE event
+    updatedAsset, err := s.store.Get(ctx, asset.ID)
+    if err == nil && updatedAsset != nil {
+        s.sseBroadcast(AssetEvent{Type: "asset_updated", Asset: updatedAsset})
+    }
+
     return nil
 }
 
@@ -544,11 +721,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Generate thumbnail in background
+    // Generate thumbnail and preview in background
     go func() {
         bgCtx := context.Background()
         if err := s.generateThumbnail(bgCtx, asset); err != nil {
             log.Printf("Failed to generate thumbnail for asset %d: %v", asset.ID, err)
+        }
+        if err := s.generatePreview(bgCtx, asset); err != nil {
+            log.Printf("Failed to generate preview for asset %d: %v", asset.ID, err)
         }
     }()
 
@@ -710,6 +890,51 @@ func (s *Server) handleStreamThumbnail(w http.ResponseWriter, r *http.Request) {
     io.Copy(w, reader)
 }
 
+func (s *Server) handleStreamPreview(w http.ResponseWriter, r *http.Request) {
+    // Extract ID from path like /api/assets/123/preview
+    path := strings.TrimPrefix(r.URL.Path, "/api/assets/")
+    path = strings.TrimSuffix(path, "/preview")
+    id, err := strconv.Atoi(path)
+    if err != nil {
+        http.Error(w, "Invalid asset ID", http.StatusBadRequest)
+        return
+    }
+
+    asset, err := s.store.Get(r.Context(), id)
+    if err != nil {
+        http.Error(w, "Failed to get asset: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    if asset == nil {
+        http.Error(w, "Asset not found", http.StatusNotFound)
+        return
+    }
+    if asset.PreviewPath == nil {
+        http.Error(w, "Preview not available", http.StatusNotFound)
+        return
+    }
+
+    ctx := r.Context()
+    obj := s.gcsClient.Bucket(s.bucketName).Object(*asset.PreviewPath)
+    attrs, err := obj.Attrs(ctx)
+    if err != nil {
+        http.Error(w, "Failed to get preview attributes: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    reader, err := obj.NewReader(ctx)
+    if err != nil {
+        http.Error(w, "Failed to read preview: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    defer reader.Close()
+
+    w.Header().Set("Content-Type", "video/mp4")
+    w.Header().Set("Content-Length", strconv.FormatInt(attrs.Size, 10))
+    w.Header().Set("Cache-Control", "public, max-age=86400")
+    io.Copy(w, reader)
+}
+
 func (s *Server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodDelete {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -742,6 +967,13 @@ func (s *Server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
     if asset.ThumbnailPath != nil {
         if err := s.gcsClient.Bucket(s.bucketName).Object(*asset.ThumbnailPath).Delete(ctx); err != nil {
             log.Printf("Warning: failed to delete thumbnail from GCS: %v", err)
+        }
+    }
+
+    // Delete preview from GCS if exists
+    if asset.PreviewPath != nil {
+        if err := s.gcsClient.Bucket(s.bucketName).Object(*asset.PreviewPath).Delete(ctx); err != nil {
+            log.Printf("Warning: failed to delete preview from GCS: %v", err)
         }
     }
 
@@ -979,6 +1211,10 @@ func (s *Server) routes() http.Handler {
             s.handleStreamThumbnail(w, r)
             return
         }
+        if strings.HasSuffix(r.URL.Path, "/preview") {
+            s.handleStreamPreview(w, r)
+            return
+        }
         if strings.HasSuffix(r.URL.Path, "/youtube") {
             switch r.Method {
             case http.MethodGet:
@@ -1006,6 +1242,9 @@ func (s *Server) routes() http.Handler {
     mux.HandleFunc("/api/auth/youtube", s.handleYouTubeAuth)
     mux.HandleFunc("/api/auth/youtube/callback", s.handleYouTubeCallback)
     mux.HandleFunc("/api/auth/youtube/status", s.handleYouTubeStatus)
+
+    // SSE endpoint for real-time updates
+    mux.HandleFunc("/api/events", s.handleSSE)
 
     // Health check
     mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -1082,7 +1321,8 @@ func main() {
     log.Println("  GET    /api/assets              - List assets (?status=pending)")
     log.Println("  GET    /api/assets/:id          - Get asset details")
     log.Println("  PUT    /api/assets/:id          - Update status")
-    log.Println("  GET    /api/assets/:id/stream   - Stream media for preview")
+    log.Println("  GET    /api/assets/:id/stream   - Stream original media")
+    log.Println("  GET    /api/assets/:id/preview  - Stream low-res preview (MP4)")
     log.Println("  DELETE /api/assets/:id          - Delete asset")
     log.Println("  POST   /api/assets/:id/youtube  - Upload to YouTube")
     log.Println("  GET    /api/auth/youtube        - Start YouTube OAuth")
