@@ -13,6 +13,7 @@ import (
     "log"
     "net/http"
     "os"
+    "os/exec"
     "path/filepath"
     "strconv"
     "strings"
@@ -29,15 +30,16 @@ import (
 
 // Asset represents a media file in the system
 type Asset struct {
-    ID        int       `json:"id"`
-    Name      string    `json:"name"`
-    Size      int64     `json:"size"`
-    MimeType  string    `json:"mime_type"`
-    Status    string    `json:"status"` // pending, approved, rejected, uploaded
-    GCSPath   string    `json:"gcs_path"`
-    YouTubeID *string   `json:"youtube_id,omitempty"`
-    CreatedAt time.Time `json:"created_at"`
-    UpdatedAt time.Time `json:"updated_at"`
+    ID            int       `json:"id"`
+    Name          string    `json:"name"`
+    Size          int64     `json:"size"`
+    MimeType      string    `json:"mime_type"`
+    Status        string    `json:"status"` // pending, approved, rejected, uploaded
+    GCSPath       string    `json:"gcs_path"`
+    ThumbnailPath *string   `json:"thumbnail_path,omitempty"`
+    YouTubeID     *string   `json:"youtube_id,omitempty"`
+    CreatedAt     time.Time `json:"created_at"`
+    UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // YouTubeVideo represents an uploaded YouTube video linked to an asset
@@ -76,14 +78,15 @@ func (s *AssetStore) Create(ctx context.Context, asset *Asset) (*Asset, error) {
 func (s *AssetStore) Get(ctx context.Context, id int) (*Asset, error) {
     query := `
         SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
-               yv.youtube_id, a.created_at, a.updated_at
+               a.thumbnail_path, yv.youtube_id, a.created_at, a.updated_at
         FROM assets a
         LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
         WHERE a.id = $1`
     asset := &Asset{}
     err := s.db.QueryRowContext(ctx, query, id).Scan(
         &asset.ID, &asset.Name, &asset.Size, &asset.MimeType,
-        &asset.Status, &asset.GCSPath, &asset.YouTubeID, &asset.CreatedAt, &asset.UpdatedAt,
+        &asset.Status, &asset.GCSPath, &asset.ThumbnailPath, &asset.YouTubeID,
+        &asset.CreatedAt, &asset.UpdatedAt,
     )
     if err == sql.ErrNoRows {
         return nil, nil
@@ -100,7 +103,7 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
     if status != "" {
         query = `
             SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
-                   yv.youtube_id, a.created_at, a.updated_at
+                   a.thumbnail_path, yv.youtube_id, a.created_at, a.updated_at
             FROM assets a
             LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
             WHERE a.status = $1 ORDER BY a.created_at DESC`
@@ -108,7 +111,7 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
     } else {
         query = `
             SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
-                   yv.youtube_id, a.created_at, a.updated_at
+                   a.thumbnail_path, yv.youtube_id, a.created_at, a.updated_at
             FROM assets a
             LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
             ORDER BY a.created_at DESC`
@@ -125,7 +128,8 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
         asset := &Asset{}
         err := rows.Scan(
             &asset.ID, &asset.Name, &asset.Size, &asset.MimeType,
-            &asset.Status, &asset.GCSPath, &asset.YouTubeID, &asset.CreatedAt, &asset.UpdatedAt,
+            &asset.Status, &asset.GCSPath, &asset.ThumbnailPath, &asset.YouTubeID,
+            &asset.CreatedAt, &asset.UpdatedAt,
         )
         if err != nil {
             return nil, err
@@ -147,6 +151,13 @@ func (s *AssetStore) Update(ctx context.Context, id int, status string) (*Asset,
 
 func (s *AssetStore) Delete(ctx context.Context, id int) error {
     _, err := s.db.ExecContext(ctx, "DELETE FROM assets WHERE id = $1", id)
+    return err
+}
+
+func (s *AssetStore) UpdateThumbnailPath(ctx context.Context, id int, thumbnailPath string) error {
+    _, err := s.db.ExecContext(ctx,
+        `UPDATE assets SET thumbnail_path = $1, updated_at = NOW() WHERE id = $2`,
+        thumbnailPath, id)
     return err
 }
 
@@ -393,6 +404,91 @@ func isMediaFile(name string) bool {
     return false
 }
 
+func isVideoFile(name string) bool {
+    extensions := []string{".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    lower := strings.ToLower(name)
+    for _, ext := range extensions {
+        if strings.HasSuffix(lower, ext) {
+            return true
+        }
+    }
+    return false
+}
+
+// generateThumbnail creates a thumbnail from a video file using ffmpeg
+// Downloads from GCS, generates thumbnail, uploads back to GCS
+func (s *Server) generateThumbnail(ctx context.Context, asset *Asset) error {
+    if !isVideoFile(asset.Name) {
+        return nil // Skip non-video files
+    }
+
+    // Create temp files
+    tempVideo, err := os.CreateTemp("", "video-*"+filepath.Ext(asset.Name))
+    if err != nil {
+        return fmt.Errorf("failed to create temp video file: %w", err)
+    }
+    defer os.Remove(tempVideo.Name())
+    defer tempVideo.Close()
+
+    tempThumb, err := os.CreateTemp("", "thumb-*.jpg")
+    if err != nil {
+        return fmt.Errorf("failed to create temp thumbnail file: %w", err)
+    }
+    defer os.Remove(tempThumb.Name())
+    tempThumb.Close()
+
+    // Download video from GCS
+    obj := s.gcsClient.Bucket(s.bucketName).Object(asset.GCSPath)
+    reader, err := obj.NewReader(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to read from GCS: %w", err)
+    }
+    defer reader.Close()
+
+    if _, err := io.Copy(tempVideo, reader); err != nil {
+        return fmt.Errorf("failed to download video: %w", err)
+    }
+    tempVideo.Close()
+
+    // Generate thumbnail with ffmpeg (capture frame at 1 second, scale to 320px width)
+    cmd := exec.CommandContext(ctx, "ffmpeg",
+        "-i", tempVideo.Name(),
+        "-ss", "00:00:01",
+        "-vframes", "1",
+        "-vf", "scale=320:-1",
+        "-y",
+        tempThumb.Name(),
+    )
+    if output, err := cmd.CombinedOutput(); err != nil {
+        return fmt.Errorf("ffmpeg failed: %w, output: %s", err, string(output))
+    }
+
+    // Upload thumbnail to GCS
+    thumbnailPath := fmt.Sprintf("thumbnails/%d.jpg", asset.ID)
+    thumbReader, err := os.Open(tempThumb.Name())
+    if err != nil {
+        return fmt.Errorf("failed to open thumbnail: %w", err)
+    }
+    defer thumbReader.Close()
+
+    wc := s.gcsClient.Bucket(s.bucketName).Object(thumbnailPath).NewWriter(ctx)
+    wc.ContentType = "image/jpeg"
+    if _, err := io.Copy(wc, thumbReader); err != nil {
+        return fmt.Errorf("failed to upload thumbnail: %w", err)
+    }
+    if err := wc.Close(); err != nil {
+        return fmt.Errorf("failed to close GCS writer: %w", err)
+    }
+
+    // Update asset with thumbnail path
+    if err := s.store.UpdateThumbnailPath(ctx, asset.ID, thumbnailPath); err != nil {
+        return fmt.Errorf("failed to update thumbnail path: %w", err)
+    }
+
+    log.Printf("Generated thumbnail for asset %d: %s", asset.ID, thumbnailPath)
+    return nil
+}
+
 // Handlers
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -446,6 +542,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Failed to create asset record: "+err.Error(), http.StatusInternalServerError)
         return
     }
+
+    // Generate thumbnail in background
+    go func() {
+        bgCtx := context.Background()
+        if err := s.generateThumbnail(bgCtx, asset); err != nil {
+            log.Printf("Failed to generate thumbnail for asset %d: %v", asset.ID, err)
+        }
+    }()
 
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(http.StatusCreated)
@@ -564,6 +668,44 @@ func (s *Server) handleStreamAsset(w http.ResponseWriter, r *http.Request) {
 
     w.Header().Set("Content-Type", asset.MimeType)
     w.Header().Set("Content-Length", strconv.FormatInt(asset.Size, 10))
+    io.Copy(w, reader)
+}
+
+func (s *Server) handleStreamThumbnail(w http.ResponseWriter, r *http.Request) {
+    // Extract ID from path like /api/assets/123/thumbnail
+    path := strings.TrimPrefix(r.URL.Path, "/api/assets/")
+    path = strings.TrimSuffix(path, "/thumbnail")
+    id, err := strconv.Atoi(path)
+    if err != nil {
+        http.Error(w, "Invalid asset ID", http.StatusBadRequest)
+        return
+    }
+
+    asset, err := s.store.Get(r.Context(), id)
+    if err != nil {
+        http.Error(w, "Failed to get asset: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    if asset == nil {
+        http.Error(w, "Asset not found", http.StatusNotFound)
+        return
+    }
+    if asset.ThumbnailPath == nil {
+        http.Error(w, "Thumbnail not available", http.StatusNotFound)
+        return
+    }
+
+    ctx := r.Context()
+    obj := s.gcsClient.Bucket(s.bucketName).Object(*asset.ThumbnailPath)
+    reader, err := obj.NewReader(ctx)
+    if err != nil {
+        http.Error(w, "Failed to read thumbnail: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    defer reader.Close()
+
+    w.Header().Set("Content-Type", "image/jpeg")
+    w.Header().Set("Cache-Control", "public, max-age=86400")
     io.Copy(w, reader)
 }
 
@@ -823,6 +965,10 @@ func (s *Server) routes() http.Handler {
     mux.HandleFunc("/api/assets/", func(w http.ResponseWriter, r *http.Request) {
         if strings.HasSuffix(r.URL.Path, "/stream") {
             s.handleStreamAsset(w, r)
+            return
+        }
+        if strings.HasSuffix(r.URL.Path, "/thumbnail") {
+            s.handleStreamThumbnail(w, r)
             return
         }
         if strings.HasSuffix(r.URL.Path, "/youtube") {

@@ -25,7 +25,8 @@ CREATE TABLE public.assets (
     status character varying(20) DEFAULT 'pending'::character varying NOT NULL,
     gcs_path character varying(500) NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    thumbnail_path character varying(500)
 );
 
 
@@ -229,4 +230,5 @@ ALTER TABLE ONLY public.youtube_videos
 INSERT INTO public.schema_migrations (version) VALUES
     ('20260102000001'),
     ('20260102000002'),
-    ('20260102000003');
+    ('20260102000003'),
+    ('20260102000004');
