@@ -895,9 +895,9 @@ func (s *Server) handleYouTubeUpload(w http.ResponseWriter, r *http.Request) {
         },
     }
 
-    // Upload to YouTube
+    // Upload to YouTube using resumable upload for large files
     call := ytService.Videos.Insert([]string{"snippet", "status"}, video)
-    call.Media(reader)
+    call.ResumableMedia(ctx, reader, asset.Size, asset.MimeType)
 
     response, err := call.Do()
     if err != nil {
