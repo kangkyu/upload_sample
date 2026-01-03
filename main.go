@@ -967,6 +967,8 @@ func (s *Server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
     if asset.ThumbnailPath != nil {
         if err := s.gcsClient.Bucket(s.bucketName).Object(*asset.ThumbnailPath).Delete(ctx); err != nil {
             log.Printf("Warning: failed to delete thumbnail from GCS: %v", err)
+        } else {
+            log.Printf("Deleted thumbnail for asset %d: %s", asset.ID, *asset.ThumbnailPath)
         }
     }
 
@@ -974,6 +976,8 @@ func (s *Server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
     if asset.PreviewPath != nil {
         if err := s.gcsClient.Bucket(s.bucketName).Object(*asset.PreviewPath).Delete(ctx); err != nil {
             log.Printf("Warning: failed to delete preview from GCS: %v", err)
+        } else {
+            log.Printf("Deleted preview for asset %d: %s", asset.ID, *asset.PreviewPath)
         }
     }
 
