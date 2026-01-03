@@ -24,6 +24,7 @@ import (
     "github.com/joho/godotenv"
     "golang.org/x/oauth2"
     "golang.org/x/oauth2/google"
+    "google.golang.org/api/googleapi"
     "google.golang.org/api/option"
     "google.golang.org/api/youtube/v3"
 )
@@ -895,9 +896,9 @@ func (s *Server) handleYouTubeUpload(w http.ResponseWriter, r *http.Request) {
         },
     }
 
-    // Upload to YouTube using resumable upload for large files
+    // Upload to YouTube using chunked upload for large files
     call := ytService.Videos.Insert([]string{"snippet", "status"}, video)
-    call.ResumableMedia(ctx, reader, asset.Size, asset.MimeType)
+    call.Media(reader, googleapi.ChunkSize(googleapi.DefaultUploadChunkSize))
 
     response, err := call.Do()
     if err != nil {
