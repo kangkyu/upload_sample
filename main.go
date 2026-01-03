@@ -734,7 +734,14 @@ func (s *Server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
     // Delete from GCS
     ctx := r.Context()
     if err := s.gcsClient.Bucket(s.bucketName).Object(asset.GCSPath).Delete(ctx); err != nil {
-        log.Printf("Warning: failed to delete from GCS: %v", err)
+        log.Printf("Warning: failed to delete video from GCS: %v", err)
+    }
+
+    // Delete thumbnail from GCS if exists
+    if asset.ThumbnailPath != nil {
+        if err := s.gcsClient.Bucket(s.bucketName).Object(*asset.ThumbnailPath).Delete(ctx); err != nil {
+            log.Printf("Warning: failed to delete thumbnail from GCS: %v", err)
+        }
     }
 
     if err := s.store.Delete(ctx, id); err != nil {
