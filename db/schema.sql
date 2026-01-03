@@ -94,6 +94,40 @@ ALTER SEQUENCE public.youtube_tokens_id_seq OWNED BY public.youtube_tokens.id;
 
 
 --
+-- Name: youtube_videos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.youtube_videos (
+    id integer NOT NULL,
+    asset_id integer NOT NULL,
+    youtube_id character varying(20) NOT NULL,
+    title character varying(255),
+    privacy_status character varying(20) DEFAULT 'private'::character varying,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: youtube_videos_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.youtube_videos_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: youtube_videos_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.youtube_videos_id_seq OWNED BY public.youtube_videos.id;
+
+
+--
 -- Name: assets id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -105,6 +139,13 @@ ALTER TABLE ONLY public.assets ALTER COLUMN id SET DEFAULT nextval('public.asset
 --
 
 ALTER TABLE ONLY public.youtube_tokens ALTER COLUMN id SET DEFAULT nextval('public.youtube_tokens_id_seq'::regclass);
+
+
+--
+-- Name: youtube_videos id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.youtube_videos ALTER COLUMN id SET DEFAULT nextval('public.youtube_videos_id_seq'::regclass);
 
 
 --
@@ -132,6 +173,22 @@ ALTER TABLE ONLY public.youtube_tokens
 
 
 --
+-- Name: youtube_videos youtube_videos_asset_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.youtube_videos
+    ADD CONSTRAINT youtube_videos_asset_id_key UNIQUE (asset_id);
+
+
+--
+-- Name: youtube_videos youtube_videos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.youtube_videos
+    ADD CONSTRAINT youtube_videos_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: idx_assets_created_at; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -146,6 +203,21 @@ CREATE INDEX idx_assets_status ON public.assets USING btree (status);
 
 
 --
+-- Name: idx_youtube_videos_asset_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_youtube_videos_asset_id ON public.youtube_videos USING btree (asset_id);
+
+
+--
+-- Name: youtube_videos youtube_videos_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.youtube_videos
+    ADD CONSTRAINT youtube_videos_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.assets(id) ON DELETE CASCADE;
+
+
+--
 -- PostgreSQL database dump complete
 --
 
@@ -156,4 +228,5 @@ CREATE INDEX idx_assets_status ON public.assets USING btree (status);
 
 INSERT INTO public.schema_migrations (version) VALUES
     ('20260102000001'),
-    ('20260102000002');
+    ('20260102000002'),
+    ('20260102000003');

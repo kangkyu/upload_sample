@@ -35,8 +35,19 @@ type Asset struct {
     MimeType  string    `json:"mime_type"`
     Status    string    `json:"status"` // pending, approved, rejected, uploaded
     GCSPath   string    `json:"gcs_path"`
+    YouTubeID *string   `json:"youtube_id,omitempty"`
     CreatedAt time.Time `json:"created_at"`
     UpdatedAt time.Time `json:"updated_at"`
+}
+
+// YouTubeVideo represents an uploaded YouTube video linked to an asset
+type YouTubeVideo struct {
+    ID            int       `json:"id"`
+    AssetID       int       `json:"asset_id"`
+    YouTubeID     string    `json:"youtube_id"`
+    Title         string    `json:"title,omitempty"`
+    PrivacyStatus string    `json:"privacy_status"`
+    CreatedAt     time.Time `json:"created_at"`
 }
 
 // AssetStore manages assets in PostgreSQL
@@ -64,12 +75,15 @@ func (s *AssetStore) Create(ctx context.Context, asset *Asset) (*Asset, error) {
 
 func (s *AssetStore) Get(ctx context.Context, id int) (*Asset, error) {
     query := `
-        SELECT id, name, size, mime_type, status, gcs_path, created_at, updated_at
-        FROM assets WHERE id = $1`
+        SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
+               yv.youtube_id, a.created_at, a.updated_at
+        FROM assets a
+        LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
+        WHERE a.id = $1`
     asset := &Asset{}
     err := s.db.QueryRowContext(ctx, query, id).Scan(
         &asset.ID, &asset.Name, &asset.Size, &asset.MimeType,
-        &asset.Status, &asset.GCSPath, &asset.CreatedAt, &asset.UpdatedAt,
+        &asset.Status, &asset.GCSPath, &asset.YouTubeID, &asset.CreatedAt, &asset.UpdatedAt,
     )
     if err == sql.ErrNoRows {
         return nil, nil
@@ -85,13 +99,19 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
     var args []interface{}
     if status != "" {
         query = `
-            SELECT id, name, size, mime_type, status, gcs_path, created_at, updated_at
-            FROM assets WHERE status = $1 ORDER BY created_at DESC`
+            SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
+                   yv.youtube_id, a.created_at, a.updated_at
+            FROM assets a
+            LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
+            WHERE a.status = $1 ORDER BY a.created_at DESC`
         args = []interface{}{status}
     } else {
         query = `
-            SELECT id, name, size, mime_type, status, gcs_path, created_at, updated_at
-            FROM assets ORDER BY created_at DESC`
+            SELECT a.id, a.name, a.size, a.mime_type, a.status, a.gcs_path,
+                   yv.youtube_id, a.created_at, a.updated_at
+            FROM assets a
+            LEFT JOIN youtube_videos yv ON a.id = yv.asset_id
+            ORDER BY a.created_at DESC`
     }
 
     rows, err := s.db.QueryContext(ctx, query, args...)
@@ -105,7 +125,7 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
         asset := &Asset{}
         err := rows.Scan(
             &asset.ID, &asset.Name, &asset.Size, &asset.MimeType,
-            &asset.Status, &asset.GCSPath, &asset.CreatedAt, &asset.UpdatedAt,
+            &asset.Status, &asset.GCSPath, &asset.YouTubeID, &asset.CreatedAt, &asset.UpdatedAt,
         )
         if err != nil {
             return nil, err
@@ -116,14 +136,51 @@ func (s *AssetStore) List(ctx context.Context, status string) ([]*Asset, error) 
 }
 
 func (s *AssetStore) Update(ctx context.Context, id int, status string) (*Asset, error) {
+    // Update the asset
+    _, err := s.db.ExecContext(ctx, `UPDATE assets SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
+    if err != nil {
+        return nil, err
+    }
+    // Fetch with youtube_id join
+    return s.Get(ctx, id)
+}
+
+func (s *AssetStore) Delete(ctx context.Context, id int) error {
+    _, err := s.db.ExecContext(ctx, "DELETE FROM assets WHERE id = $1", id)
+    return err
+}
+
+// YouTubeVideoStore manages YouTube video records in PostgreSQL
+type YouTubeVideoStore struct {
+    db *sql.DB
+}
+
+func NewYouTubeVideoStore(db *sql.DB) *YouTubeVideoStore {
+    return &YouTubeVideoStore{db: db}
+}
+
+func (s *YouTubeVideoStore) Create(ctx context.Context, video *YouTubeVideo) (*YouTubeVideo, error) {
     query := `
-        UPDATE assets SET status = $1, updated_at = NOW()
-        WHERE id = $2
-        RETURNING id, name, size, mime_type, status, gcs_path, created_at, updated_at`
-    asset := &Asset{}
-    err := s.db.QueryRowContext(ctx, query, status, id).Scan(
-        &asset.ID, &asset.Name, &asset.Size, &asset.MimeType,
-        &asset.Status, &asset.GCSPath, &asset.CreatedAt, &asset.UpdatedAt,
+        INSERT INTO youtube_videos (asset_id, youtube_id, title, privacy_status)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, created_at`
+    err := s.db.QueryRowContext(ctx, query,
+        video.AssetID, video.YouTubeID, video.Title, video.PrivacyStatus,
+    ).Scan(&video.ID, &video.CreatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return video, nil
+}
+
+func (s *YouTubeVideoStore) GetByAssetID(ctx context.Context, assetID int) (*YouTubeVideo, error) {
+    query := `
+        SELECT id, asset_id, youtube_id, title, privacy_status, created_at
+        FROM youtube_videos WHERE asset_id = $1`
+    video := &YouTubeVideo{}
+    err := s.db.QueryRowContext(ctx, query, assetID).Scan(
+        &video.ID, &video.AssetID, &video.YouTubeID, &video.Title,
+        &video.PrivacyStatus, &video.CreatedAt,
     )
     if err == sql.ErrNoRows {
         return nil, nil
@@ -131,12 +188,7 @@ func (s *AssetStore) Update(ctx context.Context, id int, status string) (*Asset,
     if err != nil {
         return nil, err
     }
-    return asset, nil
-}
-
-func (s *AssetStore) Delete(ctx context.Context, id int) error {
-    _, err := s.db.ExecContext(ctx, "DELETE FROM assets WHERE id = $1", id)
-    return err
+    return video, nil
 }
 
 // Encryption helpers using AES-GCM
@@ -256,11 +308,12 @@ func (s *TokenStore) Get(ctx context.Context) (*oauth2.Token, error) {
 
 // Server holds the HTTP server dependencies
 type Server struct {
-    store        *AssetStore
-    tokenStore   *TokenStore
-    gcsClient    *storage.Client
-    bucketName   string
-    youtubeOAuth *oauth2.Config
+    store             *AssetStore
+    tokenStore        *TokenStore
+    youtubeVideoStore *YouTubeVideoStore
+    gcsClient         *storage.Client
+    bucketName        string
+    youtubeOAuth      *oauth2.Config
 }
 
 func NewServer(db *sql.DB, bucketName string, ytClientID, ytClientSecret string, encryptionKey []byte) (*Server, error) {
@@ -282,11 +335,12 @@ func NewServer(db *sql.DB, bucketName string, ytClientID, ytClientSecret string,
     }
 
     return &Server{
-        store:        NewAssetStore(db),
-        tokenStore:   NewTokenStore(db, encryptionKey),
-        gcsClient:    client,
-        bucketName:   bucketName,
-        youtubeOAuth: youtubeOAuth,
+        store:             NewAssetStore(db),
+        tokenStore:        NewTokenStore(db, encryptionKey),
+        youtubeVideoStore: NewYouTubeVideoStore(db),
+        gcsClient:         client,
+        bucketName:        bucketName,
+        youtubeOAuth:      youtubeOAuth,
     }, nil
 }
 
@@ -555,7 +609,9 @@ func (s *Server) handleYouTubeAuth(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "YouTube OAuth not configured", http.StatusServiceUnavailable)
         return
     }
-    url := s.youtubeOAuth.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+    // AccessTypeOffline requests a refresh token
+    // ApprovalForce forces consent screen to always get a fresh refresh token
+    url := s.youtubeOAuth.AuthCodeURL("state-token", oauth2.AccessTypeOffline, oauth2.ApprovalForce)
     http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
@@ -575,6 +631,12 @@ func (s *Server) handleYouTubeCallback(w http.ResponseWriter, r *http.Request) {
     if err != nil {
         http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
         return
+    }
+
+    if token.RefreshToken == "" {
+        log.Println("Warning: No refresh token received from Google")
+    } else {
+        log.Println("Refresh token received successfully")
     }
 
     if err := s.tokenStore.Save(r.Context(), token); err != nil {
@@ -694,10 +756,25 @@ func (s *Server) handleYouTubeUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Update asset status
+    // Save YouTube video record
+    ytVideo, err := s.youtubeVideoStore.Create(ctx, &YouTubeVideo{
+        AssetID:       id,
+        YouTubeID:     response.Id,
+        Title:         title,
+        PrivacyStatus: "private",
+    })
+    if err != nil {
+        log.Printf("Failed to save YouTube video record: %v", err)
+        http.Error(w, "Video uploaded to YouTube but failed to save record: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    // Update asset status to uploaded
     asset, err = s.store.Update(ctx, id, "uploaded")
     if err != nil {
-        log.Printf("Warning: failed to update asset status: %v", err)
+        log.Printf("Failed to update asset status: %v", err)
+        http.Error(w, "Failed to update asset status: "+err.Error(), http.StatusInternalServerError)
+        return
     }
 
     // Save new token if it was refreshed
@@ -708,11 +785,33 @@ func (s *Server) handleYouTubeUpload(w http.ResponseWriter, r *http.Request) {
 
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
-        "youtube_id":         response.Id,
-        "youtube_url":        "https://www.youtube.com/watch?v=" + response.Id,
-        "youtube_studio_url": "https://studio.youtube.com/video/" + response.Id + "/edit",
-        "asset":              asset,
+        "youtube_video": ytVideo,
+        "asset":         asset,
     })
+}
+
+func (s *Server) handleGetYouTubeVideo(w http.ResponseWriter, r *http.Request) {
+    // Extract asset ID from path like /api/assets/123/youtube
+    path := strings.TrimPrefix(r.URL.Path, "/api/assets/")
+    path = strings.TrimSuffix(path, "/youtube")
+    id, err := strconv.Atoi(path)
+    if err != nil {
+        http.Error(w, "Invalid asset ID", http.StatusBadRequest)
+        return
+    }
+
+    video, err := s.youtubeVideoStore.GetByAssetID(r.Context(), id)
+    if err != nil {
+        http.Error(w, "Failed to get YouTube video: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    if video == nil {
+        http.Error(w, "YouTube video not found", http.StatusNotFound)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(video)
 }
 
 func (s *Server) routes() http.Handler {
@@ -727,7 +826,14 @@ func (s *Server) routes() http.Handler {
             return
         }
         if strings.HasSuffix(r.URL.Path, "/youtube") {
-            s.handleYouTubeUpload(w, r)
+            switch r.Method {
+            case http.MethodGet:
+                s.handleGetYouTubeVideo(w, r)
+            case http.MethodPost:
+                s.handleYouTubeUpload(w, r)
+            default:
+                http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+            }
             return
         }
         switch r.Method {
