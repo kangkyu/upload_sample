@@ -36,3 +36,6 @@ Thumbs.db
 !go.sum
 .env
 .env.local
+
+mam-server
+main
